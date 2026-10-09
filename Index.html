@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract ApexCoverageSyndicate {
+    enum PolicyStatus { Active, Settled, Canceled }
+
+    struct CoveragePolicy {
+        address payable policyHolder;
+        uint256 insuredAmount;
+        uint256 premiumPaid;
+        uint256 expiresAt;
+        PolicyStatus status;
+        bytes32 riskCoverTag;
+    }
+
+    address payable public immutable syndicateDirector;
+    string public protocolDescriptor;
+    uint256 public basePremiumRateBps;
+    uint256 public policyCounter;
+    uint256 public totalReserveLiquidity;
+    uint256 public accumulatedFees;
+    bool public isProtocolHalted;
+
+    mapping(address => bool) public authorizedKeepers;
+    mapping(uint256 => CoveragePolicy) public policies;
+
+    event KeeperAuthorized(address indexed keeper);
+    event KeeperRevoked(address indexed keeper);
+    event FeeRateAdjusted(uint256 newRateBps);
+    event PolicyCanceled(uint256 indexed policyId, uint256 refundAmount);
+    event CoverageClaimed(uint256 indexed policyId, uint256 payout);
+    event ReserveLiquiditySupplied(address indexed funder, uint256 amount);
+    event ReservesDrained(address indexed director, uint256 amount);
+    event PolicyExtended(uint256 indexed policyId, uint256 newExpiry);
+    event FeesHarvested(address indexed director, uint256 amount);
+    event PolicyIssued(uint256 indexed policyId, address indexed holder, uint256 insuredAmount);
+    event CapacityRebalanced(uint256 newTotalReserve);
+    event HaltStateToggled(bool isHalted);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyDirector() {
+        require(msg.sender == syndicateDirector, "Syndicate: Access denied");
+        _;
+    }
+
+    modifier onlyKeeperOrDirector() {
+        require(msg.sender == syndicateDirector || authorizedKeepers[msg.sender], "Syndicate: Unauthorized");
+        _;
+    }
+
+    modifier whenNotHalted() {
+        require(!isProtocolHalted, "Syndicate: Protocol halted");
+        _;
+    }
+
+    constructor() {
+        syndicateDirector = payable(msg.sender);
+        protocolDescriptor = "Apex Base On-Chain Risk Syndicate Core v1";
+        basePremiumRateBps = 250;
+        isProtocolHalted = false;
+        authorizedKeepers[msg.sender] = true;
+    }
+
+    // 1. addAuthorizedKeeper
+    function addAuthorizedKeeper(address keeper) external onlyDirector {
+        require(keeper != address(0), "Syndicate: Zero address");
+        require(!authorizedKeepers[keeper], "Syndicate: Already keeper");
+        authorizedKeepers[keeper] = true;
+        emit KeeperAuthorized(keeper);
+    }
+
+    // 2. adjustFeeParameter
+    function adjustFeeParameter(uint256 newFeeBps) external onlyDirector {
+        require(newFeeBps <= 1500, "Syndicate: Fee cap 15%");
+        basePremiumRateBps = newFeeBps;
+        emit FeeRateAdjusted(newFeeBps);
+    }
+
+    // 3. cancelInsurancePolicy
+    function cancelInsurancePolicy(uint256 policyId) external {
+        CoveragePolicy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "Syndicate: Invalid ID");
+        require(p.policyHolder == msg.sender || msg.sender == syndicateDirector, "Syndicate: Forbidden");
+        require(p.status == PolicyStatus.Active, "Syndicate: Not active");
+
+        p.status = PolicyStatus.Canceled;
+        uint256 refund = p.insuredAmount;
+        p.insuredAmount = 0;
+        totalReserveLiquidity -= refund;
+
+        (bool sent, ) = p.policyHolder.call{value: refund}("");
+        require(sent, "Syndicate: Refund failed");
+
+        emit PolicyCanceled(policyId, refund);
+    }
+
+    // 4. claimCoveragePayout
+    function claimCoveragePayout(uint256 policyId, uint256 payoutAmount) external onlyKeeperOrDirector {
+        CoveragePolicy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "Syndicate: Invalid ID");
+        require(p.status == PolicyStatus.Active, "Syndicate: Not active");
+        require(payoutAmount <= p.insuredAmount && payoutAmount > 0, "Syndicate: Invalid payout");
+
+        p.status = PolicyStatus.Settled;
+        p.insuredAmount -= payoutAmount;
+        totalReserveLiquidity -= payoutAmount;
+
+        (bool sent, ) = p.policyHolder.call{value: payoutAmount}("");
+        require(sent, "Syndicate: Claim payout failed");
+
+        emit CoverageClaimed(policyId, payoutAmount);
+    }
+
+    // 5. depositReserveLiquidity
+    function depositReserveLiquidity() external payable onlyDirector {
+        require(msg.value > 0, "Syndicate: Zero deposit");
+        totalReserveLiquidity += msg.value;
+        emit ReserveLiquiditySupplied(msg.sender, msg.value);
+    }
+
+    // 6. drainEmergencyReserves
+    function drainEmergencyReserves() external onlyDirector {
+        uint256 surplus = address(this).balance > totalReserveLiquidity ? address(this).balance - totalReserveLiquidity : 0;
+        if (surplus == 0 && address(this).balance > 0 && policyCounter == 0) {
+            surplus = address(this).balance;
+        }
+        require(surplus > 0, "Syndicate: No surplus");
+
+        (bool sent, ) = syndicateDirector.call{value: surplus}("");
+        require(sent, "Syndicate: Drain failed");
+
+        emit ReservesDrained(syndicateDirector, surplus);
+    }
+
+    // 7. extendPolicyExpiry
+    function extendPolicyExpiry(uint256 policyId, uint256 extraSeconds) external whenNotHalted {
+        CoveragePolicy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "Syndicate: Invalid ID");
+        require(p.policyHolder == msg.sender || msg.sender == syndicateDirector, "Syndicate: Forbidden");
+        require(p.status == PolicyStatus.Active, "Syndicate: Not active");
+        require(extraSeconds > 0, "Syndicate: Invalid extra time");
+
+        p.expiresAt += extraSeconds;
+        emit PolicyExtended(policyId, p.expiresAt);
+    }
+
+    // 8. harvestProtocolFees
+    function harvestProtocolFees() external onlyDirector {
+        uint256 fees = accumulatedFees;
+        require(fees > 0, "Syndicate: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = syndicateDirector.call{value: fees}("");
+        require(sent, "Syndicate: Fee harvest failed");
+
+        emit FeesHarvested(syndicateDirector, fees);
+    }
+
+    // 9. issueInsurancePolicy
+    function issueInsurancePolicy(
+        bytes32 riskCoverTag,
+        uint256 durationSeconds
+    ) external payable whenNotHalted returns (uint256) {
+        require(msg.value > 0, "Syndicate: Premium required");
+        require(durationSeconds >= 60, "Syndicate: Min duration 60s");
+
+        uint256 fee = (msg.value * basePremiumRateBps) / 10000;
+        uint256 netCover = msg.value - fee;
+        accumulatedFees += fee;
+
+        policyCounter++;
+        policies[policyCounter] = CoveragePolicy({
+            policyHolder: payable(msg.sender),
+            insuredAmount: netCover,
+            premiumPaid: fee,
+            expiresAt: block.timestamp + durationSeconds,
+            status: PolicyStatus.Active,
+            riskCoverTag: riskCoverTag
+        });
+
+        totalReserveLiquidity += netCover;
+        emit PolicyIssued(policyCounter, msg.sender, netCover);
+        return policyCounter;
+    }
+
+    // 10. rebalancePoolCapacity
+    function rebalancePoolCapacity(uint256 adjustmentDelta) external onlyDirector {
+        totalReserveLiquidity += adjustmentDelta;
+        emit CapacityRebalanced(totalReserveLiquidity);
+    }
+
+    // 11. revokeKeeper
+    function revokeKeeper(address keeper) external onlyDirector {
+        require(authorizedKeepers[keeper], "Syndicate: Not an authorized keeper");
+        authorizedKeepers[keeper] = false;
+        emit KeeperRevoked(keeper);
+    }
+
+    // 12. toggleProtocolHalt
+    function toggleProtocolHalt(bool isHalted) external onlyDirector {
+        isProtocolHalted = isHalted;
+        emit HaltStateToggled(isHalted);
+    }
+
+    // 13. updateProtocolDescriptor
+    function updateProtocolDescriptor(string calldata newDescriptor) external onlyDirector {
+        require(bytes(newDescriptor).length > 0, "Syndicate: Empty descriptor");
+        protocolDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getPolicyDetails(uint256 policyId) external view returns (
+        address holder,
+        uint256 insuredAmount,
+        uint256 premiumPaid,
+        uint256 expiresAt,
+        PolicyStatus status,
+        bytes32 tag
+    ) {
+        CoveragePolicy memory p = policies[policyId];
+        return (p.policyHolder, p.insuredAmount, p.premiumPaid, p.expiresAt, p.status, p.riskCoverTag);
+    }
+}
